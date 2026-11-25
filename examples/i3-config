@@ -1,0 +1,17 @@
+# voice-to-clip in i3: press $mod+n, then u / e / l.
+# The recording window is a kitty window with class "voice-to-clip".
+
+mode "voice" {
+        # Your default language (from config.edn), accurate large-v3 model
+        bindsym u      exec --no-startup-id voice-to-clip --vad --live --large ; mode "default"
+        # English, fast turbo model
+        bindsym e      exec --no-startup-id voice-to-clip --vad --live -l en ; mode "default"
+        # Auto-detect the language
+        bindsym l      exec --no-startup-id voice-to-clip --vad --live -l auto ; mode "default"
+        bindsym Return mode "default"
+        bindsym Escape mode "default"
+}
+bindsym $mod+n mode "voice"
+
+# Optional: keep the recording window small and floating.
+for_window [class="voice-to-clip"] floating enable, resize set 900 400, move position center

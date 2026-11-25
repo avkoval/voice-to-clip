@@ -1,0 +1,17 @@
+;; ~/.config/voice-to-clip/config.edn — every key is optional.
+{;; Microphone to record from (a name from `pactl list short sources`).
+ ;; Falls back to the system default input when it is not connected.
+ :device     "alsa_input.usb-Your_Microphone-00.mono-fallback"
+
+ ;; Default spoken language: "en", "uk", "de", ... or "auto" (the default).
+ :language   "en"
+
+ ;; Where ggml-*.bin models live (default ~/Models/whisper.cpp).
+ :models-dir "~/Models/whisper.cpp"
+
+ ;; Where recordings (.wav) and transcripts (.txt) are kept
+ ;; (default ~/.local/state/voice-to-clip).
+ :output-dir "~/.local/state/voice-to-clip"
+
+ ;; Whisper CPU threads; use the number of physical cores (default 4).
+ :threads    4}

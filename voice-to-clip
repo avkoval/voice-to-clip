@@ -1,0 +1,471 @@
+#!/usr/bin/env bb
+;; voice-to-clip — record voice, transcribe with whisper.cpp, copy result to clipboard.
+;;
+;; https://github.com/avkoval/voice-to-clip
+;;
+;; Intended for a window-manager hotkey. The outer invocation spawns a new kitty
+;; window (--class voice-to-clip) and re-execs itself inside it with
+;; VOICE_TO_CLIP_INNER=1; the inner does the actual work so 'q' and the
+;; recording UX live in a real PTY. The window closes by itself on success;
+;; on failure it waits for Enter so the error can be read. Pass --hold to
+;; keep the window open after a successful run too.
+;;
+;; Example i3 binding:
+;;   bindsym $mod+v exec --no-startup-id voice-to-clip --live
+;;
+;; --live transcribes piece by piece while recording (see the section below),
+;; so the text shows up as you speak and only the last piece is left after q.
+;; --large uses full large-v3 instead of turbo (slower, better Ukrainian).
+;;
+;; Optional settings live in ~/.config/voice-to-clip/config.edn (see
+;; examples/config.edn); command-line options override them.
+
+(require '[babashka.process :as p]
+         '[babashka.fs :as fs]
+         '[clojure.java.io :as io]
+         '[clojure.string :as str]
+         '[clojure.tools.cli :as cli]
+         '[babashka.http-client :as http]
+         '[clojure.edn :as edn])
+
+(def inner-marker "VOICE_TO_CLIP_INNER")
+
+(def config-file
+  (str (fs/path (or (System/getenv "XDG_CONFIG_HOME") (fs/expand-home "~/.config"))
+                "voice-to-clip" "config.edn")))
+
+(def config
+  "User settings: :device :language :models-dir :output-dir :threads.
+  Missing file = all defaults."
+  (if (fs/exists? config-file)
+    (edn/read-string (slurp config-file))
+    {}))
+
+(defn expand [path] (str (fs/expand-home path)))
+
+(def models-dir  (expand (:models-dir config "~/Models/whisper.cpp")))
+(def turbo-model (str models-dir "/ggml-large-v3-turbo-q5_0.bin"))
+(def large-model (str models-dir "/ggml-large-v3-q5_0.bin"))
+(def output-dir  (expand (:output-dir config
+                                      (str (or (System/getenv "XDG_STATE_HOME")
+                                               (fs/expand-home "~/.local/state"))
+                                           "/voice-to-clip"))))
+
+;; Pinning a mic in the config means a newly plugged-in webcam can't silently
+;; become the input. Falls back to the system default when it is not connected.
+(def preferred-source (:device config))
+
+(def cli-options
+  [["-l" "--language LANG"     "Whisper language (uk, en, de, auto, ...)" :default (:language config "auto")]
+   ["-m" "--model PATH"        "Path to ggml-*.bin model (default: turbo, or large-v3 with --large)"]
+   [nil  "--large"             "Final pass with full large-v3 (slower, better for Ukrainian)"]
+   [nil  "--live"              "Transcribe piece by piece while recording (text shows live, little wait after q)"]
+   ["-t" "--threads N"         "Whisper threads (= physical cores)"
+    :default (:threads config 4) :parse-fn #(Integer/parseInt %)]
+   ["-d" "--device DEV"        "Audio input source name (pactl list short sources); default: :device from config, else system default"]
+   [nil  "--input-format FMT"  "ffmpeg input format (pulse|jack|alsa)" :default "pulse"]
+   [nil  "--vad"               "Enable Voice Activity Detection (skip silence)"]
+   [nil  "--vad-model PATH"    "Path to Silero VAD model"
+    :default (str models-dir "/ggml-silero-v5.1.2.bin")]
+   [nil  "--inline"            "Run in current terminal, don't spawn a new kitty"]
+   [nil  "--hold"              "Keep the kitty window open after success"]
+   [nil  "--no-keep-wav"       "Delete the recorded .wav after transcription"]
+   ["-h" "--help"              "Show this help"]])
+
+(defn die! [code msg & args]
+  (binding [*out* *err*]
+    (println (apply format msg args)))
+  ;; The spawned kitty window closes when we exit — keep it up so the
+  ;; error stays readable.
+  (when (System/getenv inner-marker)
+    (println)
+    (println "Press Enter to close…")
+    (read-line))
+  (System/exit code))
+
+(defn check-tool! [bin]
+  (or (-> (p/shell {:out :string :err :string :continue true} "which" bin)
+          :out str/trim not-empty)
+      (die! 2 "%s not found on PATH." bin)))
+
+(defn timestamp []
+  (.format (java.time.LocalDateTime/now)
+           (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss")))
+
+(defn resolve-device [device input-format]
+  (cond
+    device device
+    (or (nil? preferred-source) (not= input-format "pulse")) "default"
+    (str/includes? (:out (p/shell {:out :string :continue true}
+                                  "pactl" "list" "short" "sources"))
+                   preferred-source)
+    preferred-source
+    :else (do (println (format "⚠  %s not found — using the system default input."
+                               preferred-source))
+              "default")))
+
+;; ---- --live: incremental transcription while recording -------------------
+;; ffmpeg keeps writing the .wav; a worker cuts the new audio at pauses and
+;; sends each piece to a whisper-server that keeps the model loaded. While a
+;; piece is being transcribed, audio piles up and the next piece is longer, so
+;; the worker never falls behind. After q only the unsent tail is left.
+
+(def sample-rate 16000)
+(def frame-samples 320)       ; 20 ms frames → 50 per second
+(def min-piece-frames 150)    ; 3 s: don't cut shorter pieces while recording
+(def max-piece-frames 1400)   ; 28 s: Whisper's window is 30 s
+(def min-pause-frames 20)     ; 400 ms of quiet counts as a pause
+
+(def silence-hallucinations
+  "Whole-piece phrases Whisper invents on near-silence; dropped from short pieces."
+  #"(?iu)(дякую( за перегляд)?|дякуємо( за перегляд)?|субтитри.*|продовження.*|thank you|thanks for watching)[.!…]*")
+
+(defn free-port []
+  (with-open [s (java.net.ServerSocket. 0)] (.getLocalPort s)))
+
+(defn start-server! [{:keys [model language threads vad vad-model]}]
+  (let [port (free-port)
+        srv  (apply p/process {:out (io/file "/dev/null") :err (io/file "/dev/null")
+                               :in (io/file "/dev/null")}
+                    (cond-> ["whisper-server" "-m" model "-l" language "-t" (str threads)
+                             "-bs" "5" "-bo" "5" "-nt"
+                             "--host" "127.0.0.1" "--port" (str port) "--public" "/nonexistent"]
+                      vad (into ["--vad" "-vm" vad-model])))]
+    (.addShutdownHook (Runtime/getRuntime) (Thread. #(p/destroy srv)))
+    {:port port :proc srv}))
+
+(defn wait-for-server! [{:keys [port proc]}]
+  (loop [n 0]
+    (when-not (p/alive? proc)
+      (throw (ex-info "whisper-server exited during startup" {})))
+    (when-not (try (http/get (format "http://127.0.0.1:%d/" port) {:throw false :timeout 1000})
+                   (catch Exception _ nil))
+      (when (> n 300) (throw (ex-info "whisper-server did not start in 60 s" {})))
+      (Thread/sleep 200)
+      (recur (inc n)))))
+
+(defn wav-data-offset
+  "Byte offset of the PCM data in a wav that ffmpeg may still be writing, or nil."
+  [wav]
+  (when (and (fs/exists? wav) (pos? (fs/size wav)))
+    (let [head (byte-array 512)
+          n    (with-open [in (io/input-stream wav)] (.read in head))
+          i    (str/index-of (String. head 0 (max n 0) "ISO-8859-1") "data")]
+      (when (and i (>= n (+ i 8))) (+ i 8)))))
+
+(defn read-bytes
+  "Raw PCM bytes of `wav` from sample `from` up to sample `to` (nil = current end)."
+  ^bytes [wav data-off from to]
+  (with-open [raf (java.io.RandomAccessFile. (str wav) "r")]
+    (let [start (+ data-off (* 2 from))
+          end   (if to (+ data-off (* 2 to)) (.length raf))
+          n     (* 2 (quot (max 0 (- end start)) 2))
+          buf   (byte-array n)]
+      (.seek raf start)
+      (.readFully raf buf)
+      buf)))
+
+(defn frame-dbs
+  "RMS level (dBFS) of each complete 20 ms frame of 16-bit LE PCM `buf`."
+  [^bytes buf]
+  (vec (for [f (range (quot (alength buf) (* 2 frame-samples)))]
+         (let [o  (* f 2 frame-samples)
+               ss (loop [i 0 acc 0.0]
+                    (if (< i frame-samples)
+                      (let [j (+ o (* 2 i))
+                            v (/ (unchecked-short (bit-or (bit-shift-left (aget buf (inc j)) 8)
+                                                          (bit-and (aget buf j) 0xff)))
+                                 32768.0)]
+                        (recur (inc i) (+ acc (* v v))))
+                      acc))]
+           (* 10 (Math/log10 (+ 1e-10 (/ ss frame-samples))))))))
+
+(defn quiet-threshold
+  "Noise floor (10th percentile of the last 30 s, digital silence ignored) + 10 dB."
+  [frames]
+  (let [xs (sort (filter #(> % -90) (subvec frames (max 0 (- (count frames) 1500)))))]
+    (if (seq xs) (+ 10 (nth xs (quot (count xs) 10))) -60)))
+
+(defn latest-pause-mid
+  "Middle frame of the latest quiet run of ≥ min-pause-frames in [lo, hi),
+  if that middle leaves a piece of at least `min-len` frames after `lo`."
+  [frames lo hi thr min-len]
+  (let [ok (fn [a b] (let [mid (quot (+ a b) 2)]
+                       (when (and (>= (- b a) min-pause-frames) (>= (- mid lo) min-len)) mid)))]
+    (loop [i (dec hi) run-end nil]
+      (cond
+        (< i lo) (when run-end (ok lo run-end))
+        (< (frames i) thr) (recur (dec i) (or run-end (inc i)))
+        (and run-end (>= (- run-end (inc i)) min-pause-frames)) (ok (inc i) run-end)
+        :else (recur (dec i) nil)))))
+
+(defn find-cut
+  "Frame to end the next piece at (pending audio starts at `cut-f`), or nil to wait."
+  [frames cut-f]
+  (let [n   (- (count frames) cut-f)
+        thr (quiet-threshold frames)]
+    (when (>= n min-piece-frames)
+      (or (latest-pause-mid frames cut-f (min (count frames) (+ cut-f max-piece-frames))
+                            thr min-piece-frames)
+          (when (>= n max-piece-frames)
+            ;; No pause in 28 s: cut at the quietest frame of the last 5 s.
+            (apply min-key frames (range (+ cut-f max-piece-frames -250)
+                                         (+ cut-f max-piece-frames))))))))
+
+(defn speech?
+  "At least 200 ms in frames [a, b) clearly above the quiet threshold."
+  [frames a b]
+  (let [thr (+ 6 (quiet-threshold frames))]
+    (>= (count (filter #(> % thr) (subvec frames a b))) 10)))
+
+(defn wav-bytes [^bytes pcm]
+  (let [n  (alength pcm)
+        bb (doto (java.nio.ByteBuffer/allocate (+ 44 n))
+             (.order java.nio.ByteOrder/LITTLE_ENDIAN))]
+    (doto bb
+      (.put (.getBytes "RIFF")) (.putInt (+ 36 n)) (.put (.getBytes "WAVEfmt "))
+      (.putInt 16) (.putShort (short 1)) (.putShort (short 1))
+      (.putInt sample-rate) (.putInt (* 2 sample-rate)) (.putShort (short 2)) (.putShort (short 16))
+      (.put (.getBytes "data")) (.putInt n) (.put pcm))
+    (.array bb)))
+
+(defn transcribe-piece [port ^bytes pcm language prompt]
+  (let [tmp (fs/create-temp-file {:prefix "voice-piece-" :suffix ".wav"})]
+    (try
+      (fs/write-bytes tmp (wav-bytes pcm))
+      ;; curl, not babashka.http-client: whisper-server rejects the latter's
+      ;; multipart body as "Invalid request".
+      (let [r (p/shell {:out :string :err :string :continue true}
+                       "curl" "-sS" "--fail-with-body" "--max-time" "180"
+                       (format "http://127.0.0.1:%d/inference" port)
+                       "-F" (str "file=@" tmp) "-F" "response_format=text"
+                       "-F" (str "language=" language) "-F" (str "prompt=" prompt))]
+        (when-not (zero? (:exit r))
+          (throw (ex-info (str "whisper-server: " (str/trim (str (:err r) (:out r)))) {})))
+        (str/trim (str/replace (:out r) #"\s+" " ")))
+      (finally (fs/delete-if-exists tmp)))))
+
+(defn start-live-worker!
+  "Future that transcribes pieces as they appear and, once `done` is set and the
+  tail is sent, yields the vector of piece texts."
+  [{:keys [wav server language done]}]
+  (future
+    (wait-for-server! server)          ; audio keeps accumulating meanwhile
+    (loop [off nil, frames [], cut-f 0, texts []]
+      (let [finished? @done            ; read before the file, so the last read sees all audio
+            off       (or off (wav-data-offset wav))]
+        (if-not off
+          (if finished? texts (do (Thread/sleep 200) (recur nil frames cut-f texts)))
+          (let [frames (into frames (frame-dbs (read-bytes wav off (* (count frames) frame-samples) nil)))
+                end-f  (if finished?
+                         (when (> (- (count frames) cut-f) 15) (count frames))
+                         (find-cut frames cut-f))]
+            (cond
+              end-f
+              (let [text (when (speech? frames cut-f end-f)
+                           (transcribe-piece (:port server)
+                                             (read-bytes wav off (* cut-f frame-samples)
+                                                         (* end-f frame-samples))
+                                             language
+                                             (let [s (str/join " " texts)]
+                                               (subs s (max 0 (- (count s) 200))))))
+                    text (when-not (or (str/blank? text)
+                                       (and (< (- end-f cut-f) 125)
+                                            (re-matches silence-hallucinations text)))
+                           text)]
+                (when text (println (str "  › " text)) (flush))
+                (recur off frames end-f (cond-> texts text (conj text))))
+
+              finished? texts
+              :else (do (Thread/sleep 300) (recur off frames cut-f texts)))))))))
+
+(defn record!
+  "Records to `wav` until q. With :live, returns the incrementally transcribed
+  text (nil if live transcription failed, so the caller falls back)."
+  [{:keys [wav input-format device live] :as opts}]
+  (println)
+  (println (format "🎙  Recording → %s" wav))
+  (println "   Press  q  (or Ctrl+C) to stop.")
+  (when live
+    (println "   Text appears after each pause; after q only the last piece is left."))
+  (println)
+  (let [done   (atom false)
+        server (when live (start-server! opts))
+        worker (when live (start-live-worker! (assoc opts :server server :done done)))]
+    (p/shell {:continue true :in :inherit :out :inherit :err :inherit}
+             "ffmpeg" "-hide_banner" "-loglevel" "error" (if live "-nostats" "-stats")
+             "-f" input-format "-i" device
+             "-ac" "1" "-ar" "16000" "-c:a" "pcm_s16le"
+             "-y" wav)
+    (when-not (fs/exists? wav)
+      (die! 3 "No output file produced — ffmpeg crashed before writing."))
+    (when (< (fs/size wav) 1000)
+      (die! 3 "Recording too short / empty (%d bytes) — aborting." (fs/size wav)))
+    (when live
+      (reset! done true)
+      (println)
+      (println "⏳ Finishing the last piece…")
+      (try
+        (str/join " " @worker)
+        (catch Exception e
+          (println (format "⚠  Live transcription failed (%s) — transcribing the whole file."
+                           (ex-message (or (ex-cause e) e))))
+          nil)
+        (finally (p/destroy (:proc server)))))))
+
+(defn transcribe! [{:keys [model wav of language threads vad vad-model]}]
+  (println)
+  (println "🧠 Transcribing with whisper.cpp…")
+  (let [base-args ["whisper-cli"
+                   "-m" model
+                   "-l" language
+                   "-f" wav
+                   "-of" of
+                   "-otxt" "-nt"
+                   "-t" (str threads)
+                   "-pp"]
+        args (cond-> base-args
+               vad (into ["--vad" "-vm" vad-model]))
+        result (apply p/shell {:continue true :out :inherit :err :inherit} args)]
+    (when-not (zero? (:exit result))
+      (die! 4 "whisper-cli failed (exit %d)." (:exit result)))))
+
+(defn on-path? [bin]
+  (-> (p/shell {:out :string :err :string :continue true} "which" bin) :exit zero?))
+
+(defn clipboard-tool []
+  (cond (on-path? "copyq")                                      :copyq
+        (and (System/getenv "WAYLAND_DISPLAY") (on-path? "wl-copy")) :wl-copy
+        (on-path? "xclip")                                      :xclip))
+
+(defn to-clipboard! [text]
+  ;; No trailing newline (slurp+trim already stripped it). xclip/wl-copy keep
+  ;; the clipboard only while their forked child lives, and kitty kills that
+  ;; child when the window closes — so prefer CopyQ, which owns it
+  ;; persistently. `add` + `select 0`, not `copy`: CopyQ keeps no history of
+  ;; what `copy` sets, so the next copy elsewhere would lose the dictation.
+  ;; Otherwise detach the tool into its own session.
+  (case (clipboard-tool)
+    :copyq   (do (p/shell {:in text :out :string} "copyq" "add" "-")
+                 (p/shell {:out :string} "copyq" "select" "0"))
+    :wl-copy (p/shell {:in text} "setsid" "wl-copy")
+    :xclip   (p/shell {:in text} "setsid" "xclip" "-selection" "clipboard" "-in")))
+
+(defn notify! [text]
+  (let [preview (str/replace text #"\s+" " ")
+        body    (if (> (count preview) 200)
+                  (str (subs preview 0 200) "…")
+                  preview)]
+    (p/shell {:continue true} "notify-send" "Voice → clipboard" body)))
+
+(defn run-inner [args]
+  (let [{:keys [options summary errors]} (cli/parse-opts args cli-options)
+        {:keys [help language threads input-format vad vad-model no-keep-wav large live]} options
+        model (or (:model options) (if large large-model turbo-model))
+        device (resolve-device (:device options) input-format)]
+    (when help
+      (println "Usage: voice-to-clip [OPTIONS]")
+      (println)
+      (println "Record voice, transcribe locally with whisper.cpp, copy result to clipboard.")
+      (println "By default spawns a new kitty window for the recording UI.")
+      (println)
+      (println "Options:")
+      (println summary)
+      (println)
+      (println "Examples:")
+      (println "  voice-to-clip                              # language from config (default auto)")
+      (println "  voice-to-clip -l en                        # English")
+      (println "  voice-to-clip -d alsa_input.usb-Some_Mic-00.mono-fallback")
+      (println "  voice-to-clip --inline                     # run in current kitty (no new window)")
+      (println "  voice-to-clip --live                       # see text while speaking")
+      (println "  voice-to-clip --live --large               # live, with the accurate large-v3 model")
+      (println)
+      (println "i3 binding (example):")
+      (println "  bindsym $mod+v exec --no-startup-id voice-to-clip --live")
+      (println)
+      (println (str "Config: " config-file (if (fs/exists? config-file) "" " (not present)")))
+      (System/exit 0))
+    (when errors
+      (die! 1 "Argument errors:\n  %s" (str/join "\n  " errors)))
+
+    (check-tool! "ffmpeg")
+    (check-tool! "whisper-cli")
+    (check-tool! "notify-send")
+    (when-not (clipboard-tool)
+      (die! 2 "No clipboard tool found: install copyq (recommended), wl-clipboard or xclip."))
+
+    (when-not (fs/exists? model)
+      (die! 5 (str "Model file not found: %s\n"
+                   "Download with:\n"
+                   "  mkdir -p %s && cd %s && \\\n"
+                   "  curl -L -O https://huggingface.co/ggerganov/whisper.cpp/resolve/main/%s")
+            model (fs/parent model) (fs/parent model) (fs/file-name model)))
+    (when live
+      (check-tool! "whisper-server"))
+
+    (when (and vad (not (fs/exists? vad-model)))
+      (die! 5 (str "VAD model file not found: %s\n"
+                   "Download with:\n"
+                   "  cd " models-dir " && \\\n"
+                   "  curl -L -O https://huggingface.co/ggml-org/whisper-vad/resolve/main/%s")
+            vad-model (fs/file-name vad-model)))
+
+    (let [_         (fs/create-dirs output-dir)
+          stem      (str "voice-" (timestamp))
+          of-prefix (str output-dir "/" stem)
+          wav       (str of-prefix ".wav")
+          txt       (str of-prefix ".txt")]
+
+      (println (format "Model: %s | lang=%s | input=%s/%s | threads=%d | vad=%s | live=%s"
+                       (fs/file-name model) language input-format device threads
+                       (if vad "on" "off") (if live "on" "off")))
+
+      (if-let [live-text (record! {:wav wav :input-format input-format :device device
+                                   :live live :model model :language language
+                                   :threads threads :vad vad :vad-model vad-model})]
+        (spit txt live-text)
+        (transcribe! {:model model :wav wav :of of-prefix
+                      :language language :threads threads
+                      :vad vad :vad-model vad-model}))
+
+      (let [text (str/trim (slurp txt))]
+        (when (empty? text)
+          (die! 6 "Transcription is empty — was the mic actually picking up audio?"))
+        (to-clipboard! text)
+        (notify! text)
+        (println)
+        (println "✓ Copied to clipboard:")
+        (println "─────────────────────────────────────────────────────────────")
+        (println text)
+        (println "─────────────────────────────────────────────────────────────")
+        (println (format "WAV: %s  (%d bytes)" wav (fs/size wav)))
+        (when no-keep-wav
+          (fs/delete-if-exists wav)
+          (println "      (deleted — --no-keep-wav)"))))))
+
+(defn run-outer []
+  (check-tool! "kitty")
+  (let [self (or (System/getProperty "babashka.file")
+                 (die! 1 "Cannot determine script path; run as a file."))
+        hold (some #{"--hold"} *command-line-args*)
+        argv (-> ["kitty" "--class" "voice-to-clip"]
+                 (cond-> hold (conj "--hold"))
+                 (conj "--" self)
+                 (into (remove #{"--hold"} *command-line-args*)))]
+    ;; apply: babashka.process variadic expects (process opts? cmd & args).
+    ;; Passing the vector as the second positional gets stringified to "[kitty …"
+    ;; instead of being unwrapped, so we splat it.
+    (apply p/process
+           {:extra-env {inner-marker "1"}
+            :out (io/file "/dev/null")
+            :err (io/file "/dev/null")
+            :in  (io/file "/dev/null")}
+           argv)
+    (System/exit 0)))
+
+(let [args     *command-line-args*
+      inline?  (some #{"--inline"} args)
+      filtered (remove #{"--inline" "--hold"} args)]
+  (if (or (System/getenv inner-marker) inline?)
+    (run-inner filtered)
+    (run-outer)))
