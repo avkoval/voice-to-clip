@@ -47,8 +47,10 @@ The result goes to the clipboard and is shown in a desktop notification.
 
 ## Requirements
 
-Linux with PipeWire or PulseAudio. Developed and used daily on Arch Linux with X11 and i3; the clipboard part also
-supports Wayland (`wl-copy`), but that path is less tested.
+Linux with PipeWire or PulseAudio, or macOS. Developed and used daily on Arch Linux with X11 and i3; the clipboard part
+also supports Wayland (`wl-copy`), but that path is less tested. See [macOS](#macos) for the differences there.
+
+### Linux
 
 | Tool                     | Why                                   | Arch package                                       |
 |--------------------------|---------------------------------------|----------------------------------------------------|
@@ -64,6 +66,17 @@ supports Wayland (`wl-copy`), but that path is less tested.
 On other distributions install the same tools from your package manager; whisper.cpp can be
 [built from source](https://github.com/ggml-org/whisper.cpp#quick-start) (enable `-DGGML_VULKAN=1` or
 `-DGGML_CUDA=1` for GPU).
+
+### macOS
+
+```sh
+brew install borkdude/brew/babashka whisper-cpp ffmpeg
+brew install --cask kitty
+```
+
+kitty is expected at `/Applications/kitty.app` (set `:kitty-app` in the config otherwise). The clipboard uses
+`pbcopy` (or CopyQ when it is installed), the notification uses `osascript`; both come with macOS. whisper.cpp from
+Homebrew uses the GPU through Metal.
 
 ## Installation
 
@@ -93,18 +106,23 @@ Optional: `~/.config/voice-to-clip/config.edn` (see [examples/config.edn](exampl
 omitted; command-line options override it.
 
 ```clojure
-{:device     "alsa_input.usb-Your_Microphone-00.mono-fallback"   ; from `pactl list short sources`
+{:device     "alsa_input.usb-Your_Microphone-00.mono-fallback"   ; from `voice-to-clip --list-devices`
  :language   "en"                                                ; or "uk", "de", "auto", ...
  :models-dir "~/Models/whisper.cpp"
  :output-dir "~/.local/state/voice-to-clip"
- :threads    4}
+ :threads    4
+ :kitty-app  "/Applications/kitty.app"}                          ; macOS only
 ```
 
 To find your microphone's name:
 
 ```sh
-pactl list short sources | grep -v monitor
+voice-to-clip --list-devices
 ```
+
+On Linux this lists the PulseAudio/PipeWire sources; use the name in the second column. On macOS it lists the
+AVFoundation audio inputs; use `":<index>"` or `":<name>"`, e.g. `":MacBook Pro Microphone"` (the leading colon may be
+omitted).
 
 ## Usage
 
@@ -116,8 +134,9 @@ voice-to-clip [OPTIONS]
       --large             Use the full large-v3 model (slower, better for non-English)
       --live              Transcribe piece by piece while recording
   -t, --threads N         Whisper CPU threads (= physical cores)
-  -d, --device DEV        Audio input source name; default: :device from config, else system default
-      --input-format FMT  ffmpeg input format (pulse|jack|alsa)
+  -d, --device DEV        Audio input (see --list-devices); default: :device from config, else system default
+      --input-format FMT  ffmpeg input format (pulse|jack|alsa|avfoundation; default pulse, avfoundation on macOS)
+      --list-devices      List the audio inputs and exit
       --vad               Voice activity detection (skip silence)
       --vad-model PATH    Path to the Silero VAD model
       --inline            Run in the current terminal instead of a new kitty window
@@ -181,6 +200,29 @@ super + v
     voice-to-clip --vad --live
 ```
 
+### macOS (AeroSpace, skhd)
+
+In `~/.aerospace.toml`, with the full path (the hotkey daemon doesn't see your shell's PATH):
+
+```toml
+[mode.main.binding]
+alt-v = 'exec-and-forget /Users/you/bin/voice-to-clip --vad --live'
+```
+
+With [skhd](https://github.com/koekeishiya/skhd): `alt - v : /Users/you/bin/voice-to-clip --vad --live`.
+
+## macOS
+
+The script detects macOS and switches to the native tools: `ffmpeg -f avfoundation` for recording, `pbcopy` for the
+clipboard, `osascript` for the notification. kitty is started with `open -n -a kitty.app` rather than as a child
+process. This matters for the microphone permission: macOS attributes microphone access to the app that started the
+process tree. Started directly from a hotkey daemon, ffmpeg would be attributed to the daemon, which has no microphone
+permission entry, and macOS would kill ffmpeg without a prompt. Through `open`, kitty is the responsible app, so on the
+first run macOS asks to allow microphone access for kitty, and the answer is remembered.
+
+The first run of the hotkey therefore shows a microphone prompt; allow it. If the recording fails with "No output file
+produced", check System Settings → Privacy & Security → Microphone and enable kitty there.
+
 ## Tips
 
 - **Microphone level matters more than the model.** Quiet input is the most common cause of missing or invented
@@ -196,8 +238,8 @@ super + v
 ## Troubleshooting
 
 - **The window flashes and closes**: run `voice-to-clip --inline --live` in a terminal to see the error.
-- **Wrong microphone**: set `:device` in the config or pass `-d`; the first line of the window shows which input is
-  used.
+- **Wrong microphone**: set `:device` in the config or pass `-d` (see `--list-devices`); the first line of the window
+  shows which input is used.
 - **Text disappears from the clipboard**: install CopyQ — `xclip`/`wl-copy` hold the clipboard only while their
   process lives, and the text is not kept in any history. Transcripts are always saved as `.txt` in the output
   directory.
